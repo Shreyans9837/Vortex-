@@ -1,16 +1,20 @@
 {
-  "name": "vortex-gateway-fixed",
-  "version": "1.1.0",
+  "name": "vortex-agent-trust-gateway",
+  "version": "2.0.0",
   "private": true,
+  "description": "VORTEX Agent Trust & Control Infrastructure",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "zk:setup": "node scripts/setup-zk.js"
   },
+  "engines": {"node": ">=22"},
   "dependencies": {
+    "@solana/web3.js": "^1.98.4",
     "express": "^5.1.0",
-    "sqlite3": "^5.1.7",
+    "express-rate-limit": "^7.5.1",
     "snarkjs": "^0.7.6",
-    "express-rate-limit": "^7.5.1"
+    "sqlite3": "^5.1.7"
   }
 }

@@ -1,59 +1,82 @@
-# VORTEX Gateway — Fixed Gemini Implementation
+# VORTEX Agent Trust & Control Infrastructure — Full MVP Engine
 
-This is the corrected version of the supplied Gemini implementation.
+VORTEX is a control plane for autonomous AI agents:
 
-## Critical fixes
+**Agent → Identity → Authorization → Policy → Limits → Controlled Execution → Verification → Audit**
 
-1. **Atomic replay protection:** nonce claim, spending update and audit insertion happen inside one SQLite `BEGIN IMMEDIATE` transaction. The old check-then-insert race is removed.
-2. **Nonce is scoped to the agent:** the uniqueness rule is `(agent_id, nonce)`, not nonce globally.
-3. **Ledger head is read inside the same write transaction:** concurrent requests cannot fork the hash chain through a stale previous hash.
-4. **No fake ZK verification:** missing verification key returns `NOT_GENERATED`; it never becomes a successful proof.
-5. **Invalid ZK proof is rejected.**
-6. **Authentication uses an HTTP header:** `x-vortex-api-key`, rather than putting the secret in the JSON body.
-7. **Timing-safe API-key comparison.**
-8. **Strict amount validation:** malformed amounts are rejected instead of silently becoming zero.
-9. **Input limits and rate limiting added.**
-10. **Execution result is written to the audit record so ledger verification covers the important execution state.**
-11. **No real-world payment/side-effect is claimed:** this MVP only records the controlled execution request.
+## Included
 
-## Run
+- Express API gateway
+- Public web UI at `/`
+- Gateway API credential + per-agent credential
+- Agent permissions
+- Atomic agent+nonce replay protection
+- Daily spending/action limits with daily period reset
+- SQLite WAL persistence
+- Controlled execution adapter with explicit event records
+- Hash-chained audit ledger
+- Independent ledger integrity verification
+- Real Groth16 proving endpoint when generated artifacts are present
+- Real SnarkJS Groth16 verification
+- Optional Solana environment placeholders for a future explicit settlement adapter
+- Docker build that compiles Circom and generates development Groth16 artifacts
+- Render Blueprint
+- Smoke tests
+
+## Local
 
 ```bash
-npm install
 cp .env.example .env
+npm install
+npm run zk:setup
+npm test
 npm start
 ```
 
-Set a real API key:
-
-```bash
-export VORTEX_API_KEY='replace-with-a-long-random-secret'
-```
-
-Health:
-
-```bash
-curl http://localhost:3000/api/v1/health
-```
-
-Execution:
-
-```bash
-curl -X POST http://localhost:3000/api/v1/execute   -H 'Content-Type: application/json'   -H 'x-vortex-api-key: replace-with-a-long-random-secret'   -d '{"agentId":"AGENT_01","nonce":"NONCE_001","action":"database.write","amount":100}'
-```
-
-Ledger:
-
-```bash
-curl http://localhost:3000/api/v1/ledger/verify
-```
+Set strong values in `.env` before using protected routes.
 
 ## ZK
 
-A real Groth16 verification key must exist at `ZK_VKEY`. If it does not, the response is explicitly `NOT_GENERATED`.
+The circuit proves:
 
-This file does not generate a proof. A real circuit/prover must create the proof and public signals separately.
+`c = a * b`
 
-## Important
+`a` and `b` are witness inputs; `c` is the public output. The setup script generates WASM, a proving key and a verification key for development. The `/api/v1/zk/prove` endpoint creates a real Groth16 proof with SnarkJS and self-verifies it before returning it.
 
-This is still an MVP, not a security-audited production system.
+**Important:** the included Powers of Tau contribution is development setup only. A production cryptographic deployment should use an appropriate ceremony/trust setup and independent review.
+
+## API
+
+### Public
+- `GET /`
+- `GET /api/v1/health`
+- `GET /api/v1/public/summary`
+
+### Gateway credential required
+- `POST /api/v1/zk/prove`
+- `POST /api/v1/execute`
+- `GET /api/v1/ledger`
+- `GET /api/v1/ledger/verify`
+- `GET /api/v1/metrics`
+
+Protected execution requires:
+- `x-vortex-api-key`
+- `x-vortex-agent-key`
+- `agentId`
+- `action`
+- `nonce`
+
+Example action permissions for the seeded agent:
+- `database.write`
+- `agent.action`
+- `payments.transfer`
+
+The controlled runtime records an internal execution event. It does **not** claim to have moved real money or changed an external system. External adapters must be implemented and independently tested before enabling real-world side effects.
+
+## Render
+
+The repository can be deployed with the Dockerfile/Blueprint. Configure `VORTEX_API_KEY` and `AGENT_01_KEY` as secrets. Do not commit `.env` or private keys.
+
+## Production status
+
+This is a substantially complete **MVP engine**, not a security-audited production system. Before real customers or real funds: independent security review, load/concurrency testing, secret rotation, database backup/recovery, observability, scoped credentials, external-adapter isolation, and a production ZK ceremony/setup are required.

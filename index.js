@@ -1,460 +1,215 @@
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const crypto = require('crypto');
-const snarkjs = require('snarkjs');
 const fs = require('fs');
+const path = require('path');
 const rateLimit = require('express-rate-limit');
+const snarkjs = require('snarkjs');
 
 const app = express();
 app.disable('x-powered-by');
-app.use(express.json({ limit: '32kb' }));
+app.use(express.json({ limit: '64kb' }));
+app.use(express.static(path.join(__dirname, 'public')));
 
-const PORT = Number(process.env.PORT || 3000);
-const DB_FILE = process.env.DB_FILE || './vortex.db';
-const CONFIGURED_API_KEY = process.env.VORTEX_API_KEY || '';
-const ZK_ENABLED = String(process.env.ZK_ENABLED || 'true').toLowerCase() === 'true';
-const ZK_VKEY = process.env.ZK_VKEY || './verification_key.json';
-
+const PORT = Number(process.env.PORT || 10000);
+const DB_FILE = process.env.DB_FILE || './data/vortex.db';
+const API_KEY = process.env.VORTEX_API_KEY || '';
+const ZK_ENABLED = String(process.env.ZK_ENABLED ?? 'true').toLowerCase() === 'true';
+const ZK_WASM = process.env.ZK_WASM || './zk/build/vortex_js/vortex.wasm';
+const ZK_ZKEY = process.env.ZK_ZKEY || './zk/build/vortex_final.zkey';
+const ZK_VKEY = process.env.ZK_VKEY || './zk/build/verification_key.json';
+const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
 const GENESIS_HASH = 'GENESIS_HASH_00000000000000000000000000000000';
 
-const db = new sqlite3.Database(DB_FILE, (err) => {
-  if (err) {
-    console.error('❌ DB Initialization Error:', err.message);
-    process.exit(1);
-  }
-  db.run('PRAGMA journal_mode = WAL;', (pragmaErr) => {
-    if (pragmaErr) console.error('❌ WAL setup error:', pragmaErr.message);
-    else console.log('⚡ Connected to VORTEX SQLite Engine [WAL Mode].');
-  });
-});
+fs.mkdirSync(path.dirname(path.resolve(DB_FILE)), { recursive: true });
+const db = new sqlite3.Database(DB_FILE);
 
-function run(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function (err) {
-      if (err) reject(err);
-      else resolve(this);
-    });
-  });
-}
+function run(sql, params = []) { return new Promise((resolve, reject) => db.run(sql, params, function(err){ err ? reject(err) : resolve(this); })); }
+function get(sql, params = []) { return new Promise((resolve, reject) => db.get(sql, params, (err,row)=>err?reject(err):resolve(row))); }
+function all(sql, params = []) { return new Promise((resolve, reject) => db.all(sql, params, (err,rows)=>err?reject(err):resolve(rows))); }
+function sha256(value) { return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex'); }
+function hmac(value) { return crypto.createHmac('sha256', API_KEY || 'vortex-bootstrap').update(String(value)).digest('hex'); }
+function safeEqual(a,b){ const aa=Buffer.from(String(a||'')); const bb=Buffer.from(String(b||'')); return aa.length===bb.length && crypto.timingSafeEqual(aa,bb); }
+function fail(res,status,error,message,details){ return res.status(status).json({ ok:false,error,message,...(details?{details}: {}) }); }
+function now(){ return new Date().toISOString(); }
+function id(prefix){ return `${prefix}_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`; }
+function normalizeAction(action){ return String(action||'').trim().toLowerCase(); }
+function validNonce(n){ return typeof n==='string' && /^[A-Za-z0-9._:-]{8,128}$/.test(n); }
+function amountNumber(x){ if(x===undefined || x===null || x==='') return 0; const n=Number(x); return Number.isFinite(n)&&n>=0&&n<=1e9?n:null; }
 
-function get(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-      if (err) reject(err);
-      else resolve(row);
-    });
-  });
-}
-
-function all(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.all(sql, params, (err, rows) => {
-      if (err) reject(err);
-      else resolve(rows);
-    });
-  });
-}
-
-function sha256(value) {
-  return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
-}
-
-function timingSafeEqualText(a, b) {
-  const aa = Buffer.from(String(a || ''));
-  const bb = Buffer.from(String(b || ''));
-  if (aa.length !== bb.length) return false;
-  return crypto.timingSafeEqual(aa, bb);
-}
-
-function fail(res, status, code, message) {
-  return res.status(status).json({ error: code, message });
-}
-
-async function init() {
-  await run(`CREATE TABLE IF NOT EXISTS agents (
-    agent_id TEXT PRIMARY KEY,
-    api_key_hash TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'ACTIVE',
-    daily_limit REAL NOT NULL DEFAULT 1000.0,
-    spent_today REAL NOT NULL DEFAULT 0.0,
-    permissions TEXT NOT NULL,
-    created_at TEXT NOT NULL
+async function init(){
+  await run('PRAGMA journal_mode=WAL');
+  await run('PRAGMA foreign_keys=ON');
+  await run(`CREATE TABLE IF NOT EXISTS agents(
+    agent_id TEXT PRIMARY KEY, api_key_hash TEXT NOT NULL, status TEXT NOT NULL,
+    permissions TEXT NOT NULL, daily_limit REAL NOT NULL, spent_today REAL NOT NULL DEFAULT 0,
+    spend_period TEXT NOT NULL, created_at TEXT NOT NULL
   )`);
-
-  await run(`CREATE TABLE IF NOT EXISTS processed_nonces (
-    agent_id TEXT NOT NULL,
-    nonce TEXT NOT NULL,
-    request_id TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (agent_id, nonce)
+  await run(`CREATE TABLE IF NOT EXISTS processed_nonces(
+    agent_id TEXT NOT NULL, nonce TEXT NOT NULL, request_id TEXT,
+    created_at TEXT NOT NULL, PRIMARY KEY(agent_id,nonce)
   )`);
-
-  await run(`CREATE TABLE IF NOT EXISTS audit_ledger (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    execution_id TEXT UNIQUE NOT NULL,
-    agent_id TEXT NOT NULL,
-    action TEXT NOT NULL,
-    status TEXT NOT NULL,
-    request_json TEXT NOT NULL,
-    result_json TEXT NOT NULL,
-    prev_hash TEXT NOT NULL,
-    current_hash TEXT NOT NULL,
-    zk_proof_status TEXT NOT NULL,
+  await run(`CREATE TABLE IF NOT EXISTS executions(
+    execution_id TEXT PRIMARY KEY, request_id TEXT UNIQUE, agent_id TEXT NOT NULL,
+    action TEXT NOT NULL, amount REAL NOT NULL, status TEXT NOT NULL,
+    result_json TEXT NOT NULL, created_at TEXT NOT NULL
+  )`);
+  await run(`CREATE TABLE IF NOT EXISTS audit_ledger(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, execution_id TEXT UNIQUE NOT NULL,
+    agent_id TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL,
+    request_json TEXT NOT NULL, result_json TEXT NOT NULL, zk_status TEXT NOT NULL,
+    settlement_status TEXT NOT NULL, prev_hash TEXT NOT NULL, current_hash TEXT NOT NULL,
     timestamp TEXT NOT NULL
   )`);
+  await run(`CREATE TABLE IF NOT EXISTS action_events(
+    event_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL, action TEXT NOT NULL,
+    payload_json TEXT NOT NULL, created_at TEXT NOT NULL
+  )`);
+  await run(`CREATE TABLE IF NOT EXISTS settlements(
+    settlement_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL, provider TEXT NOT NULL,
+    status TEXT NOT NULL, tx_signature TEXT, error TEXT, created_at TEXT NOT NULL
+  )`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_ledger_created ON audit_ledger(id DESC)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_exec_agent ON executions(agent_id,created_at DESC)`);
 
-  const dummyHash = sha256('secret123');
-  await run(
-    `INSERT OR IGNORE INTO agents
-      (agent_id, api_key_hash, permissions, daily_limit, created_at)
-     VALUES ('AGENT_01', ?, 'database.write,payments.transfer', 5000.0, ?)`,
-    [dummyHash, new Date().toISOString()]
-  );
-}
-
-async function verifyZk(zkProofData) {
-  if (!zkProofData || !zkProofData.proof || !zkProofData.publicSignals) {
-    return { status: 'NOT_GENERATED', verified: false };
-  }
-
-  if (!ZK_ENABLED) {
-    return { status: 'DISABLED', verified: false };
-  }
-
-  if (!fs.existsSync(ZK_VKEY)) {
-    return {
-      status: 'NOT_GENERATED',
-      verified: false,
-      reason: 'Verification key is missing'
-    };
-  }
-
-  try {
-    const vKey = JSON.parse(fs.readFileSync(ZK_VKEY, 'utf8'));
-    const verified = await snarkjs.groth16.verify(
-      vKey,
-      zkProofData.publicSignals,
-      zkProofData.proof
-    );
-
-    if (!verified) {
-      return { status: 'PROOF_INVALID', verified: false };
-    }
-
-    return { status: 'VERIFIED_VALID', verified: true };
-  } catch (error) {
-    console.error('ZK verification error:', error.message);
-    return { status: 'PROOF_ERROR', verified: false };
+  const agentKey = process.env.AGENT_01_KEY || '';
+  if(agentKey){
+    const period = new Date().toISOString().slice(0,10);
+    await run(`INSERT INTO agents(agent_id,api_key_hash,status,permissions,daily_limit,spent_today,spend_period,created_at)
+      VALUES(?,?,?,?,?,?,?,?)
+      ON CONFLICT(agent_id) DO UPDATE SET api_key_hash=excluded.api_key_hash,status='ACTIVE',permissions=excluded.permissions,daily_limit=excluded.daily_limit`,
+      ['AGENT_01', hmac(agentKey), 'ACTIVE', 'database.write,agent.action,payments.transfer', 5000, 0, period, now()]);
   }
 }
 
-async function atomicCommit({
-  agentId,
-  nonce,
-  requestId,
-  action,
-  amount,
-  executionId,
-  requestJson,
-  resultJson,
-  zkStatus
-}) {
-  const timestamp = new Date().toISOString();
-
-  await run('BEGIN IMMEDIATE TRANSACTION');
-
-  try {
-    // The database primary key enforces this atomically under concurrency.
-    try {
-      await run(
-        `INSERT INTO processed_nonces (agent_id, nonce, request_id, timestamp)
-         VALUES (?, ?, ?, ?)`,
-        [agentId, nonce, requestId, timestamp]
-      );
-    } catch (error) {
-      if (String(error.message).includes('UNIQUE constraint failed')) {
-        const replay = new Error('REPLAY_ATTACK');
-        replay.code = 'REPLAY_ATTACK';
-        throw replay;
-      }
-      throw error;
-    }
-
-    const agent = await get(
-      `SELECT spent_today, daily_limit FROM agents
-       WHERE agent_id = ? AND status = 'ACTIVE'`,
-      [agentId]
-    );
-
-    if (!agent) {
-      const error = new Error('Agent is no longer active');
-      error.code = 'AGENT_NOT_ACTIVE';
-      throw error;
-    }
-
-    if (agent.spent_today + amount > agent.daily_limit) {
-      const error = new Error('Execution quota exceeded');
-      error.code = 'LIMIT_EXCEEDED';
-      throw error;
-    }
-
-    const last = await get(
-      `SELECT current_hash FROM audit_ledger ORDER BY id DESC LIMIT 1`
-    );
-    const prevHash = last ? last.current_hash : GENESIS_HASH;
-
-    const currentHash = sha256(JSON.stringify({
-      executionId,
-      agentId,
-      action,
-      amount,
-      requestJson,
-      resultJson,
-      zkStatus,
-      prevHash,
-      timestamp
-    }));
-
-    await run(
-      `UPDATE agents
-       SET spent_today = spent_today + ?
-       WHERE agent_id = ?`,
-      [amount, agentId]
-    );
-
-    await run(
-      `INSERT INTO audit_ledger
-       (execution_id, agent_id, action, status, request_json, result_json,
-        prev_hash, current_hash, zk_proof_status, timestamp)
-       VALUES (?, ?, ?, 'ALLOWED', ?, ?, ?, ?, ?, ?)`,
-      [
-        executionId,
-        agentId,
-        action,
-        requestJson,
-        resultJson,
-        prevHash,
-        currentHash,
-        zkStatus,
-        timestamp
-      ]
-    );
-
-    await run('COMMIT');
-
-    return { prevHash, currentHash, timestamp };
-  } catch (error) {
-    try { await run('ROLLBACK'); } catch (_) {}
-    throw error;
-  }
-}
-
-const limiter = rateLimit({
-  windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS || 60000),
-  limit: Number(process.env.RATE_LIMIT_MAX || 60),
-  standardHeaders: true,
-  legacyHeaders: false
-});
+const limiter = rateLimit({ windowMs:Number(process.env.RATE_LIMIT_WINDOW_MS||60000), limit:Number(process.env.RATE_LIMIT_MAX||60), standardHeaders:true, legacyHeaders:false });
 app.use('/api/', limiter);
 
-function requireApiKey(req, res, next) {
-  if (!CONFIGURED_API_KEY) {
-    return fail(res, 503, 'AUTH_NOT_CONFIGURED', 'VORTEX_API_KEY is not configured');
-  }
-
-  const supplied = req.get('x-vortex-api-key') || '';
-  if (!timingSafeEqualText(supplied, CONFIGURED_API_KEY)) {
-    return fail(res, 401, 'UNAUTHORIZED', 'Invalid API key');
-  }
-
+function requireGateway(req,res,next){
+  if(!API_KEY) return fail(res,503,'AUTH_NOT_CONFIGURED','VORTEX_API_KEY is not configured');
+  if(!safeEqual(req.get('x-vortex-api-key')||'', API_KEY)) return fail(res,401,'UNAUTHORIZED','Invalid gateway credential');
   next();
 }
-
-app.get('/api/v1/health', async (_req, res) => {
-  res.json({
-    ok: true,
-    service: 'vortex-gateway',
-    zkEnabled: ZK_ENABLED,
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.post('/api/v1/execute', requireApiKey, async (req, res) => {
-  const {
-    agentId,
-    requestId,
-    nonce,
-    action,
-    amount,
-    zkProofData
-  } = req.body || {};
-
-  if (
-    typeof agentId !== 'string' ||
-    typeof nonce !== 'string' ||
-    typeof action !== 'string'
-  ) {
-    return fail(res, 400, 'BAD_REQUEST', 'agentId, nonce and action are required strings');
-  }
-
-  if (requestId !== undefined && typeof requestId !== 'string') {
-    return fail(res, 400, 'BAD_REQUEST', 'requestId must be a string');
-  }
-
-  const requestedAmount =
-    amount === undefined ? 0 : Number(amount);
-
-  if (!Number.isFinite(requestedAmount) || requestedAmount < 0) {
-    return fail(res, 400, 'BAD_AMOUNT', 'amount must be a non-negative finite number');
-  }
-
-  const agent = await get(
-    `SELECT * FROM agents WHERE agent_id = ? AND status = 'ACTIVE'`,
-    [agentId]
-  );
-
-  if (!agent) {
-    return fail(res, 401, 'UNAUTHORIZED', 'Agent profile invalid or suspended');
-  }
-
-  // API-key auth is the gateway credential. Agent records are still explicitly checked.
-  const agentKeyHash = sha256(req.get('x-vortex-agent-key') || '');
-  if (req.get('x-vortex-agent-key') && !timingSafeEqualText(agent.api_key_hash, agentKeyHash)) {
-    return fail(res, 403, 'FORBIDDEN', 'Invalid agent credential');
-  }
-
-  const permissions = agent.permissions.split(',').map((x) => x.trim()).filter(Boolean);
-  if (!permissions.includes(action)) {
-    return fail(res, 403, 'POLICY_VIOLATION', `Action '${action}' blocked by policy`);
-  }
-
-  if (agent.spent_today + requestedAmount > agent.daily_limit) {
-    return fail(res, 422, 'LIMIT_EXCEEDED', 'Execution quota exceeded');
-  }
-
-  const zk = await verifyZk(zkProofData);
-
-  if (zk.status === 'PROOF_INVALID' || zk.status === 'PROOF_ERROR') {
-    return fail(res, 400, 'INVALID_ZK_PROOF', 'Groth16 verification failed');
-  }
-
-  const executionId =
-    `EXEC_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
-
-  const requestJson = JSON.stringify({
-    agentId,
-    requestId: requestId || null,
-    nonce,
-    action,
-    amount: requestedAmount
-  });
-
-  // This MVP records the controlled execution. It does not claim to have
-  // performed an external database/payment side effect.
-  const result = {
-    accepted: true,
-    action,
-    amount: requestedAmount
-  };
-
-  try {
-    const audit = await atomicCommit({
-      agentId,
-      nonce,
-      requestId: requestId || null,
-      action,
-      amount: requestedAmount,
-      executionId,
-      requestJson,
-      resultJson: JSON.stringify(result),
-      zkStatus: zk.status
-    });
-
-    return res.status(200).json({
-      status: 'SUCCESS',
-      executionId,
-      agentId,
-      actionExecuted: action,
-      zkStatus: zk.status,
-      cryptographicAudit: audit
-    });
-  } catch (error) {
-    if (error.code === 'REPLAY_ATTACK') {
-      return fail(res, 409, 'REPLAY_ATTACK', 'Duplicate nonce detected for this agent');
-    }
-    if (error.code === 'LIMIT_EXCEEDED') {
-      return fail(res, 422, 'LIMIT_EXCEEDED', 'Execution quota exceeded');
-    }
-
-    console.error('Atomic execution failed:', error);
-    return fail(res, 500, 'EXECUTION_FAILED', 'Execution failed safely');
-  }
-});
-
-app.get('/api/v1/ledger/verify', requireApiKey, async (_req, res) => {
-  try {
-    const rows = await all(`SELECT * FROM audit_ledger ORDER BY id ASC`);
-
-    let previousHash = GENESIS_HASH;
-
-    for (const row of rows) {
-      if (row.prev_hash !== previousHash) {
-        return res.json({
-          ledgerIntegrity: 'CORRUPTED_OR_TAMPERED',
-          totalRecords: rows.length,
-          tamperedRowIndex: row.id,
-          reason: 'PREVIOUS_HASH_MISMATCH'
-        });
-      }
-
-      const expected = sha256(JSON.stringify({
-        executionId: row.execution_id,
-        agentId: row.agent_id,
-        action: row.action,
-        amount: JSON.parse(row.request_json).amount,
-        requestJson: row.request_json,
-        resultJson: row.result_json,
-        zkStatus: row.zk_proof_status,
-        prevHash: row.prev_hash,
-        timestamp: row.timestamp
-      }));
-
-      if (row.current_hash !== expected) {
-        return res.json({
-          ledgerIntegrity: 'CORRUPTED_OR_TAMPERED',
-          totalRecords: rows.length,
-          tamperedRowIndex: row.id,
-          reason: 'CURRENT_HASH_MISMATCH'
-        });
-      }
-
-      previousHash = row.current_hash;
-    }
-
-    return res.json({
-      ledgerIntegrity: 'VERIFIED_VALID',
-      totalRecords: rows.length,
-      tamperedRowIndex: null,
-      head: previousHash
-    });
-  } catch (error) {
-    return fail(res, 500, 'LEDGER_VERIFY_FAILED', error.message);
-  }
-});
-
-app.get('/api/v1/ledger', requireApiKey, async (_req, res) => {
-  const rows = await all(`SELECT * FROM audit_ledger ORDER BY id DESC LIMIT 100`);
-  res.json({ records: rows });
-});
-
-async function main() {
-  await init();
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 VORTEX Gateway live on http://0.0.0.0:${PORT}`);
-  });
+async function getAgent(req,res,agentId){
+  const agent=await get(`SELECT * FROM agents WHERE agent_id=? AND status='ACTIVE'`,[agentId]);
+  if(!agent) return fail(res,401,'AGENT_UNAUTHORIZED','Unknown or inactive agent');
+  const presented=req.get('x-vortex-agent-key')||'';
+  if(!presented) return fail(res,401,'AGENT_CREDENTIAL_REQUIRED','x-vortex-agent-key is required');
+  if(!safeEqual(agent.api_key_hash,hmac(presented))) return fail(res,403,'AGENT_CREDENTIAL_INVALID','Invalid agent credential');
+  return agent;
 }
 
-main().catch((error) => {
-  console.error('❌ Startup failed:', error);
-  process.exit(1);
+async function verifyZK(data){
+  if(!ZK_ENABLED) return {status:'DISABLED',verified:false};
+  if(!data || !data.proof || !Array.isArray(data.publicSignals)) return {status:'NOT_GENERATED',verified:false};
+  if(!fs.existsSync(path.resolve(ZK_VKEY))) return {status:'NOT_GENERATED',verified:false,reason:'verification key missing'};
+  try{
+    const vkey=JSON.parse(fs.readFileSync(path.resolve(ZK_VKEY),'utf8'));
+    const verified=await snarkjs.groth16.verify(vkey,data.publicSignals,data.proof);
+    return verified?{status:'VERIFIED_VALID',verified:true}:{status:'PROOF_INVALID',verified:false};
+  }catch(e){ return {status:'PROOF_ERROR',verified:false,reason:e.message}; }
+}
+
+async function proveZK(a,b){
+  if(!ZK_ENABLED) throw new Error('ZK_DISABLED');
+  const wasm=path.resolve(ZK_WASM), zkey=path.resolve(ZK_ZKEY);
+  if(!fs.existsSync(wasm)||!fs.existsSync(zkey)) throw new Error('ZK_ARTIFACTS_MISSING');
+  const {proof,publicSignals}=await snarkjs.groth16.fullProve({a:String(a),b:String(b)},wasm,zkey);
+  const verification=await verifyZK({proof,publicSignals});
+  if(!verification.verified) throw new Error('SELF_VERIFICATION_FAILED');
+  return {proof,publicSignals,verification};
+}
+
+async function executeAdapter(action,payload,executionId){
+  // Controlled internal side-effect: records an execution event. External effects remain adapters.
+  const eventId=id('EVENT');
+  await run(`INSERT INTO action_events(event_id,execution_id,action,payload_json,created_at) VALUES(?,?,?,?,?)`,[eventId,executionId,action,JSON.stringify(payload||{}),now()]);
+  return {executed:true,eventId,provider:'VORTEX_CONTROLLED_RUNTIME'};
+}
+
+async function atomicExecution({agent,agentId,nonce,requestId,action,amount,executionId,requestJson,resultJson,zkStatus,settlementStatus}){
+  const timestamp=now();
+  await run('BEGIN IMMEDIATE TRANSACTION');
+  try{
+    try{ await run(`INSERT INTO processed_nonces(agent_id,nonce,request_id,created_at) VALUES(?,?,?,?)`,[agentId,nonce,requestId,timestamp]); }
+    catch(e){ if(String(e.message).includes('UNIQUE constraint failed')){const x=new Error('REPLAY_ATTACK');x.code='REPLAY_ATTACK';throw x;} throw e; }
+    const current=await get(`SELECT spent_today,spend_period,daily_limit FROM agents WHERE agent_id=? AND status='ACTIVE'`,[agentId]);
+    if(!current){const x=new Error('AGENT_NOT_ACTIVE');x.code='AGENT_NOT_ACTIVE';throw x;}
+    let spent=Number(current.spent_today); const period=timestamp.slice(0,10);
+    if(current.spend_period!==period) spent=0;
+    if(spent+amount>Number(current.daily_limit)){const x=new Error('LIMIT_EXCEEDED');x.code='LIMIT_EXCEEDED';throw x;}
+    const last=await get(`SELECT current_hash FROM audit_ledger ORDER BY id DESC LIMIT 1`);
+    const prevHash=last?last.current_hash:GENESIS_HASH;
+    const currentHash=sha256(JSON.stringify({executionId,agentId,action,amount,requestJson,resultJson,zkStatus,settlementStatus,prevHash,timestamp}));
+    await run(`UPDATE agents SET spent_today=?,spend_period=? WHERE agent_id=?`,[spent+amount,period,agentId]);
+    await run(`INSERT INTO executions(execution_id,request_id,agent_id,action,amount,status,result_json,created_at) VALUES(?,?,?,?,?,?,?,?)`,[executionId,requestId,agentId,action,amount,'SUCCESS',resultJson,timestamp]);
+    await run(`INSERT INTO audit_ledger(execution_id,agent_id,action,status,request_json,result_json,zk_status,settlement_status,prev_hash,current_hash,timestamp) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,[executionId,agentId,action,'SUCCESS',requestJson,resultJson,zkStatus,settlementStatus,prevHash,currentHash,timestamp]);
+    await run('COMMIT');
+    return {timestamp,prevHash,currentHash};
+  }catch(e){ try{await run('ROLLBACK')}catch(_){} throw e; }
+}
+
+app.get('/',(_req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
+app.get('/api/v1/health',async(_req,res)=>{
+  const ledger=await get(`SELECT COUNT(*) AS count FROM audit_ledger`);
+  const zkArtifacts=fs.existsSync(path.resolve(ZK_VKEY))&&fs.existsSync(path.resolve(ZK_ZKEY))&&fs.existsSync(path.resolve(ZK_WASM));
+  res.json({ok:true,service:'vortex-agent-gateway',version:'2.0.0',status:'LIVE',zkEnabled:ZK_ENABLED,zkArtifacts,ledgerRecords:ledger.count,timestamp:now()});
 });
+app.get('/api/v1/public/summary',async(_req,res)=>{
+  const executions=await get(`SELECT COUNT(*) AS n FROM executions`); const agents=await get(`SELECT COUNT(*) AS n FROM agents WHERE status='ACTIVE'`); const events=await get(`SELECT COUNT(*) AS n FROM action_events`);
+  res.json({ok:true,agents:agents.n,executions:executions.n,events:events.n,product:'VORTEX Agent Trust & Control Infrastructure'});
+});
+
+app.post('/api/v1/zk/prove',requireGateway,async(req,res)=>{
+  const a=Number(req.body?.a),b=Number(req.body?.b);
+  if(!Number.isInteger(a)||!Number.isInteger(b)||a<0||b<0||a>1000000||b>1000000) return fail(res,400,'BAD_INPUT','a and b must be bounded non-negative integers');
+  try{ const result=await proveZK(a,b); return res.json({ok:true,a,b,publicSignals:result.publicSignals,proof:result.proof,verification:result.verification}); }
+  catch(e){ return fail(res,503,'ZK_UNAVAILABLE',e.message); }
+});
+
+app.post('/api/v1/execute',requireGateway,async(req,res)=>{
+  const body=req.body||{}; const {agentId,requestId,nonce}=body; const action=normalizeAction(body.action); const amount=amountNumber(body.amount);
+  if(typeof agentId!=='string'||typeof action!=='string'||!action||!validNonce(nonce)) return fail(res,400,'BAD_REQUEST','agentId, action and a valid nonce are required');
+  if(requestId!==undefined && (typeof requestId!=='string'||requestId.length>128)) return fail(res,400,'BAD_REQUEST','requestId must be a string <=128 chars');
+  if(amount===null) return fail(res,400,'BAD_AMOUNT','amount must be a finite non-negative number <= 1e9');
+  const agent=await getAgent(req,res,agentId); if(!agent || agent.headersSent) return;
+  const permissions=agent.permissions.split(',').map(x=>x.trim()).filter(Boolean);
+  if(!permissions.includes(action)) return fail(res,403,'POLICY_VIOLATION',`Action '${action}' blocked by policy`);
+  const zk=await verifyZK(body.zkProofData);
+  if(zk.status==='PROOF_INVALID'||zk.status==='PROOF_ERROR') return fail(res,400,'INVALID_ZK_PROOF','Groth16 verification failed');
+  const executionId=id('EXEC');
+  const requestJson=JSON.stringify({agentId,requestId:requestId||null,nonce,action,amount,payload:body.payload||{}});
+  let adapter;
+  try{ adapter=await executeAdapter(action,body.payload||{},executionId); }
+  catch(e){ return fail(res,500,'ACTION_FAILED','Controlled action failed safely'); }
+  const result={accepted:true,action,amount,adapter};
+  try{
+    const audit=await atomicExecution({agent,agentId,nonce,requestId:requestId||null,action,amount,executionId,requestJson,resultJson:JSON.stringify(result),zkStatus:zk.status,settlementStatus:'DISABLED'});
+    return res.json({ok:true,status:'SUCCESS',executionId,agentId,actionExecuted:action,zkStatus:zk.status,settlementStatus:'DISABLED',cryptographicAudit:audit,result});
+  }catch(e){
+    if(e.code==='REPLAY_ATTACK') return fail(res,409,'REPLAY_ATTACK','Duplicate nonce detected for this agent');
+    if(e.code==='LIMIT_EXCEEDED') return fail(res,422,'LIMIT_EXCEEDED','Execution quota exceeded');
+    console.error(e); return fail(res,500,'EXECUTION_FAILED','Execution rolled back safely');
+  }
+});
+
+app.get('/api/v1/ledger',requireGateway,async(_req,res)=>{ const rows=await all(`SELECT * FROM audit_ledger ORDER BY id DESC LIMIT 100`); res.json({ok:true,records:rows}); });
+app.get('/api/v1/ledger/verify',requireGateway,async(_req,res)=>{
+  try{
+    const rows=await all(`SELECT * FROM audit_ledger ORDER BY id ASC`); let previous=GENESIS_HASH;
+    for(const row of rows){
+      if(row.prev_hash!==previous) return res.json({ok:false,ledgerIntegrity:'CORRUPTED_OR_TAMPERED',tamperedRowId:row.id,reason:'PREVIOUS_HASH_MISMATCH'});
+      const expected=sha256(JSON.stringify({executionId:row.execution_id,agentId:row.agent_id,action:row.action,amount:JSON.parse(row.request_json).amount,requestJson:row.request_json,resultJson:row.result_json,zkStatus:row.zk_status,settlementStatus:row.settlement_status,prevHash:row.prev_hash,timestamp:row.timestamp}));
+      if(expected!==row.current_hash) return res.json({ok:false,ledgerIntegrity:'CORRUPTED_OR_TAMPERED',tamperedRowId:row.id,reason:'CURRENT_HASH_MISMATCH'});
+      previous=row.current_hash;
+    }
+    res.json({ok:true,ledgerIntegrity:'VERIFIED_VALID',totalRecords:rows.length,head:previous});
+  }catch(e){ fail(res,500,'LEDGER_VERIFY_FAILED','Ledger verification failed'); }
+});
+app.get('/api/v1/metrics',requireGateway,async(_req,res)=>{
+  const [a,e,x]=await Promise.all([get(`SELECT COUNT(*) n FROM agents WHERE status='ACTIVE'`),get(`SELECT COUNT(*) n FROM executions`),get(`SELECT COUNT(*) n FROM action_events`)]);
+  res.json({ok:true,activeAgents:a.n,executions:e.n,events:x.n});
+});
+
+async function main(){ await init(); app.listen(PORT,'0.0.0.0',()=>console.log(`VORTEX Gateway live on http://0.0.0.0:${PORT}`)); }
+main().catch(e=>{console.error('Startup failed',e);process.exit(1)});

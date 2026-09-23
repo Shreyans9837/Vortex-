@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: vortex-agent-gateway
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: VORTEX_API_KEY
+        sync: false
+      - key: AGENT_01_KEY
+        sync: false
+      - key: DB_FILE
+        value: /var/data/vortex.db
+      - key: ZK_ENABLED
+        value: "true"
+      - key: SOLANA_RPC_URL
+        value: https://api.devnet.solana.com
+      - key: SOLANA_PRIVATE_KEY
+        sync: false
+      - key: RECIPIENT_WALLET
+        sync: false
+    disk:
+      name: vortex-data
+      mountPath: /var/data
+      sizeGB: 1

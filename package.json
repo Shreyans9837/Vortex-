@@ -1,0 +1,16 @@
+{
+  "name": "vortex-gateway-fixed",
+  "version": "1.1.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "sqlite3": "^5.1.7",
+    "snarkjs": "^0.7.6",
+    "express-rate-limit": "^7.5.1"
+  }
+}
